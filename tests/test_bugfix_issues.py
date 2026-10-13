@@ -1,9 +1,11 @@
+import io
 import json
 import logging
 from pathlib import Path
 import tempfile
-from typing import cast, get_args
+from typing import Any, cast, get_args
 
+import pytest
 from typer.testing import CliRunner
 
 from azure_functions_doctor import logging_config
@@ -90,6 +92,130 @@ def test_summary_json_counts_are_integers(tmp_path: Path) -> None:
     assert isinstance(payload["passed"], int)
     assert isinstance(payload["warned"], int)
     assert isinstance(payload["failed"], int)
+
+
+_V2_FUNCTION_APP = """import azure.functions as func
+
+app = func.FunctionApp()
+
+
+@app.route(route="hello")
+def hello(req: func.HttpRequest) -> str:
+    return "ok"
+"""
+
+# Minimal custom ruleset: one deterministic file-existence check. Together with
+# the v2 function_app.py fixture this pins the finding-driven exit status
+# (host.json present -> pass/exit 0, absent -> fail/exit 1) without depending
+# on the machine's Python environment.
+_HOST_JSON_RULE = [
+    {
+        "id": "check_host_json_exists",
+        "category": "project_structure",
+        "section": "project_structure",
+        "label": "host.json",
+        "description": "Checks if host.json exists at the project root.",
+        "type": "file_exists",
+        "required": True,
+        "condition": {"target": "host.json"},
+        "check_order": 0,
+        "hint": "Add host.json to configure the Azure Functions host runtime.",
+    }
+]
+
+
+def _invoke_doctor_with_summary(project: Path, rules_path: Path, summary_path: Path) -> Any:
+    runner = CliRunner()
+    return runner.invoke(
+        app,
+        [
+            "doctor",
+            "--path",
+            str(project),
+            "--format",
+            "json",
+            "--rules",
+            str(rules_path),
+            "--summary-json",
+            str(summary_path),
+        ],
+    )
+
+
+@pytest.mark.parametrize("exc_type", [OSError, PermissionError])
+@pytest.mark.parametrize("host_json_present", [True, False])
+@pytest.mark.parametrize("failing_op", ["parent_mkdir", "sidecar_write"])
+def test_summary_sidecar_failure_stays_non_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_op: str,
+    host_json_present: bool,
+    exc_type: type[OSError],
+) -> None:
+    """Issue #449: a failing --summary-json sidecar never disturbs the report.
+
+    The sidecar is optional: its mkdir/write failures are caught and logged
+    while the primary report continues with the same finding-driven exit
+    status as the success path. Only the sidecar operation is mocked to fail;
+    no real filesystem permissions are changed.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "function_app.py").write_text(_V2_FUNCTION_APP, encoding="utf-8")
+    if host_json_present:
+        (project / "host.json").write_text("{}", encoding="utf-8")
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps(_HOST_JSON_RULE), encoding="utf-8")
+    summary_path = project / "nested" / "summary.json"
+
+    # Baseline run with a working sidecar pins the expected outcome.
+    baseline = _invoke_doctor_with_summary(project, rules_path, summary_path)
+    expected_exit = 0 if host_json_present else 1
+    assert baseline.exit_code == expected_exit
+    assert summary_path.is_file()
+    baseline_results = json.loads(baseline.stdout)["results"]
+    summary_path.unlink()
+
+    # Fail only the sidecar operation, and only for the sidecar's own path.
+    if failing_op == "parent_mkdir":
+        original_mkdir = Path.mkdir
+
+        def fake_mkdir(self: Path, *args: Any, **kwargs: Any) -> None:
+            if self == summary_path.parent:
+                raise exc_type("sidecar parent denied")
+            original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fake_mkdir)
+    else:
+        original_write_text = Path.write_text
+
+        def fake_write_text(self: Path, *args: Any, **kwargs: Any) -> int:
+            if self == summary_path:
+                raise exc_type("sidecar write denied")
+            return original_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", fake_write_text)
+
+    # Capture logging separately from the primary report stdout: the app
+    # logger sets propagate=False, so attach a dedicated stream handler.
+    logger = _reset_main_logger()
+    log_stream = io.StringIO()
+    logger.addHandler(logging.StreamHandler(log_stream))
+    result = _invoke_doctor_with_summary(project, rules_path, summary_path)
+
+    # Primary stdout JSON stays parseable and carries the same findings.
+    payload = json.loads(result.stdout)
+    assert payload["results"] == baseline_results
+    # Same finding-driven exit status as the success path.
+    assert result.exit_code == expected_exit == baseline.exit_code
+    # No summary file was created by the failed sidecar.
+    assert not summary_path.exists()
+    # The warning identifies the summary-write failure and reaches logging
+    # only — it never leaks into the primary report stdout.
+    logged = log_stream.getvalue()
+    assert "Failed to write summary JSON" in logged
+    assert str(summary_path) in logged
+    assert "Failed to write summary JSON" not in result.stdout
 
 
 def test_callable_detection_no_false_positive_for_functionapp_only() -> None:

@@ -398,6 +398,65 @@ def test_iac_beats_local_for_shared_field(tmp_path: Path) -> None:
     assert cfg.extension_version.source == "main.json"
 
 
+def test_iac_deployment_storage_beats_local_emulator(tmp_path: Path) -> None:
+    # The storage conflict itself: IaC declares a deployable storage setting
+    # while local.settings.json falls back to the development-storage emulator.
+    _write(
+        tmp_path,
+        "main.json",
+        json.dumps(
+            {
+                "resources": [
+                    {
+                        "appSettings": [
+                            {"name": "AzureWebJobsStorage", "value": "fixture-prod-storage"},
+                        ]
+                    }
+                ]
+            }
+        ),
+    )
+    _write(
+        tmp_path,
+        "local.settings.json",
+        json.dumps({"Values": {"AzureWebJobsStorage": "UseDevelopmentStorage=true"}}),
+    )
+    cfg = resolve_target_config(tmp_path)
+    # The deployed setting wins and records main.json as its source.
+    assert cfg.deployment_storage.value == "fixture-prod-storage"
+    assert cfg.deployment_storage.source == "main.json"
+    # The merged app-settings view agrees with the chosen value.
+    assert cfg.app_settings["AzureWebJobsStorage"] == "fixture-prod-storage"
+
+
+def test_local_emulator_storage_retained_without_iac(tmp_path: Path) -> None:
+    # Companion case: IaC is silent about storage, so the local emulator
+    # fallback (and its local source) survive the merge.
+    _write(
+        tmp_path,
+        "main.json",
+        json.dumps(
+            {
+                "resources": [
+                    {
+                        "appSettings": [
+                            {"name": "FUNCTIONS_EXTENSION_VERSION", "value": "~4"},
+                        ]
+                    }
+                ]
+            }
+        ),
+    )
+    _write(
+        tmp_path,
+        "local.settings.json",
+        json.dumps({"Values": {"AzureWebJobsStorage": "UseDevelopmentStorage=true"}}),
+    )
+    cfg = resolve_target_config(tmp_path)
+    assert cfg.deployment_storage.value == "UseDevelopmentStorage=true"
+    assert cfg.deployment_storage.source == "local:local.settings.json"
+
+
 def test_override_none_values_are_ignored(tmp_path: Path) -> None:
     _write(tmp_path, "plan.json", _arm_with_sku("EP1", "ElasticPremium"))
     cfg = resolve_target_config(tmp_path, {"hosting_plan": None, "runtime_version": None})
